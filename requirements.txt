@@ -1,0 +1,5 @@
+# Comic-Days Monitor 依赖
+
+requests>=2.28.0
+Pillow>=9.0.0
+PyYAML>=6.0

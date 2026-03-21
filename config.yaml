@@ -1,0 +1,44 @@
+# Comic-Days 监控配置
+
+# 要监控的漫画列表
+comics:
+  # 作品ID可以从URL获取: https://comic-days.com/series/{series_id}
+  - series_id: "3269632237268447047"
+    name: "雨夜の月"
+    enabled: true
+
+# 监控设置
+monitor:
+  # 检查间隔 (cron 表达式或小时数)
+  interval_hours: 6
+  
+  # 只下载最新N话 (0 = 全部)
+  latest_only: 1
+  
+  # 下载目录
+  download_dir: "./downloads"
+  
+  # 状态文件目录
+  state_dir: "./states"
+
+# 账号池配置
+accounts:
+  # accounts.json 文件路径 (相对于此配置文件)
+  file: "./accounts.json"
+  
+  # 最大使用账号数 (0 = 全部)
+  max_accounts: 0
+  
+  # 并发数
+  workers: 3
+
+# 日志配置
+logging:
+  # 日志级别: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+  
+  # 日志文件
+  file: "./monitor.log"
+  
+  # 控制台输出
+  console: true

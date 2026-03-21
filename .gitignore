@@ -1,0 +1,21 @@
+# 敏感文件
+accounts.json
+
+# 运行时生成
+states/
+downloads/
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
