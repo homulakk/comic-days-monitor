@@ -72,6 +72,10 @@ def setup_logging(config: dict):
     handlers = []
     
     if log_config.get("console", True):
+        # Windows 控制台编码修复
+        if sys.platform == 'win32':
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
         handlers.append(logging.StreamHandler(sys.stdout))
     
     if log_config.get("file"):
