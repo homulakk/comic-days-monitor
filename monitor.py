@@ -448,12 +448,9 @@ def load_state(series_id: str, state_dir: Path) -> dict:
             pass
     return {
         "series_id": series_id,
-        "last_episode_id": None,
         "last_checked": None,
-        "purchased": {},
-        "ticket_used": {},      # {email: timestamp}
-        "pt_used": {},          # {email: total_pt_used_in_this_series}
-        "accounts_pt": {}       # {email: actual_pt_balance} - 缓存账号 PT 余额
+        "purchased": {},       # {episode_id: {title, mode, ...}}
+        "ticket_used": {}      # {email: timestamp}
     }
 
 
@@ -465,7 +462,7 @@ def save_state(state: dict, state_dir: Path):
 
 
 def load_accounts(accounts_file: Path) -> List[dict]:
-    """加载账号池"""
+    """加载账号池（包含 PT 余额）"""
     if not accounts_file.exists():
         return []
     
@@ -476,140 +473,10 @@ def load_accounts(accounts_file: Path) -> List[dict]:
         return []
 
 
-# ============================================================================
-# 监控逻辑
-# ============================================================================
-
-def check_new_episodes(series_id: str, state: dict, logger) -> List[dict]:
-    """检查新章节"""
-    episodes = fetch_episodes_from_atom(series_id)
-    
-    if not episodes:
-        logger.warning(f"No episodes found for {series_id}")
-        return []
-    
-    # 找到上次检查后的新章节
-    last_ep_id = state.get("last_episode_id")
-    
-    if last_ep_id:
-        # 找到上次章节的位置
-        last_index = -1
-        for i, ep in enumerate(episodes):
-            if ep['id'] == last_ep_id:
-                last_index = i
-                break
-        
-        # 返回之后的所有章节（最新的在前面）
-        if last_index > 0:
-            return episodes[:last_index]
-        elif last_index == 0:
-            return []  # 没有新章节
-    
-    # 没有记录，返回全部
-    return episodes
-
-
-def find_available_accounts(accounts: List[dict], state: dict) -> List[dict]:
-    """获取可用账号，跳过 PT=0 的"""
-    accounts_pt = state.get("accounts_pt", {})
-    
-    result = []
-    for acc in accounts:
-        email = acc.get('email')
-        pt = accounts_pt.get(email)
-        
-        # PT 未记录或 PT > 0 → 尝试
-        if pt is None or pt > 0:
-            result.append(acc)
-        # PT = 0 → 跳过
-    
-    return result
-
-
-def try_purchase_with_account(
-    account: dict,
-    episode_id: str,
-    series_id: str,
-    series_name: str,
-    ep_info: dict,
-    state: dict,
-    download_dir: Path,
-    state_dir: Path,
-    logger
-) -> Tuple[bool, str]:
-    """尝试用单个账号购买章节"""
-    email = account['email']
-    password = account['password']
-    
-    session = requests.Session()
-    
-    # 登录
-    if not http_login(session, email, password):
-        return False, 'login_failed'
-    
-    # 获取 PT 并缓存
-    user_info = http_get_user_info(session)
-    actual_pt = user_info.get("point", {}).get("total", 0)
-    state.setdefault("accounts_pt", {})[email] = actual_pt
-    
-    # 计算可用 PT
-    pt_used = state.get("pt_used", {}).get(email, 0)
-    available_pt = actual_pt - pt_used
-    
-    logger.info(f"    {email[:25]}... PT: {available_pt}")
-    
-    price = ep_info.get('price', 0)
-    
-    # 尝试票据购买（如果可用）
-    ticket_info = state.get("ticket_used", {}).get(email)
-    ticket_charged = True
-    if ticket_info:
-        try:
-            last_used = datetime.fromisoformat(ticket_info)
-            if datetime.now() - last_used < timedelta(hours=23):
-                ticket_charged = False
-        except:
-            pass
-    
-    if ticket_charged:
-        success, msg = http_use_ticket(session, episode_id)
-        if success:
-            state.setdefault("ticket_used", {})[email] = datetime.now().isoformat()
-            result = download_episode(session, episode_id, series_name, download_dir)
-            state["purchased"][episode_id] = {
-                "title": result.get("title"),
-                "mode": "ticket",
-                "account": email,
-                "downloaded": result["success"],
-                "total": result["total"],
-                "at": datetime.now().isoformat()
-            }
-            save_state(state, state_dir)
-            return True, 'ok'
-    
-    # 票据不可用或失败，尝试 PT
-    if available_pt < price:
-        logger.info(f"    Insufficient PT: {available_pt} < {price}")
-        return False, 'insufficient_pt'
-    
-    success, msg = http_purchase_pt(session, episode_id)
-    if success:
-        state.setdefault("pt_used", {})[email] = pt_used + price
-        result = download_episode(session, episode_id, series_name, download_dir)
-        state["purchased"][episode_id] = {
-            "title": result.get("title"),
-            "mode": "pt",
-            "account": email,
-            "price": price,
-            "downloaded": result["success"],
-            "total": result["total"],
-            "at": datetime.now().isoformat()
-        }
-        save_state(state, state_dir)
-        return True, 'ok'
-    else:
-        logger.warning(f"    PT purchase failed: {msg}")
-        return False, 'purchase_failed'
+def save_accounts(accounts: List[dict], accounts_file: Path):
+    """保存账号池（包含更新的 PT）"""
+    data = {'accounts': accounts}
+    accounts_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 def process_episode(
@@ -617,13 +484,16 @@ def process_episode(
     series_id: str,
     series_name: str,
     accounts: List[dict],
+    accounts_file: Path,
     state: dict,
     download_dir: Path,
     state_dir: Path,
     logger
-) -> bool:
-    """处理单个章节 - 遍历账号直到买成功"""
+) -> Tuple[bool, List[dict]]:
+    """处理单个章节 - 遍历账号直到买成功
     
+    返回: (success, updated_accounts)
+    """
     # 检查是否免费
     session = requests.Session()
     ep_info = http_get_episode_info(episode_id, session)
@@ -639,40 +509,104 @@ def process_episode(
             "at": datetime.now().isoformat()
         }
         save_state(state, state_dir)
-        return True
+        return True, accounts
     
-    # 需要购买
-    available_accounts = find_available_accounts(accounts, state)
-    logger.info(f"  Trying {len(available_accounts)} accounts...")
+    # 需要购买 - 只尝试 PT > 0 的账号
+    available_accounts = [acc for acc in accounts if acc.get('pt', 0) > 0]
+    logger.info(f"  Trying {len(available_accounts)} accounts with PT > 0...")
     
-    for account in available_accounts:
-        success, reason = try_purchase_with_account(
-            account, episode_id, series_id, series_name,
-            ep_info, state, download_dir, state_dir, logger
-        )
+    for i, account in enumerate(available_accounts):
+        email = account['email']
+        password = account['password']
         
-        if success:
-            logger.info(f"  Purchase successful!")
-            return True
-        
-        if reason == 'login_failed':
+        # 登录
+        session = requests.Session()
+        if not http_login(session, email, password):
             continue
         
-        if reason == 'insufficient_pt':
-            continue  # 下一个账号
+        # 获取真实 PT
+        user_info = http_get_user_info(session)
+        actual_pt = user_info.get("point", {}).get("total", 0)
+        
+        # 更新账号 PT
+        account['pt'] = actual_pt
+        
+        logger.info(f"    {email[:25]}... PT: {actual_pt}")
+        
+        price = ep_info.get('price', 0)
+        
+        # 尝试票据
+        ticket_info = state.get("ticket_used", {}).get(email)
+        ticket_charged = True
+        if ticket_info:
+            try:
+                last_used = datetime.fromisoformat(ticket_info)
+                if datetime.now() - last_used < timedelta(hours=23):
+                    ticket_charged = False
+            except:
+                pass
+        
+        if ticket_charged:
+            success, msg = http_use_ticket(session, episode_id)
+            if success:
+                state.setdefault("ticket_used", {})[email] = datetime.now().isoformat()
+                result = download_episode(session, episode_id, series_name, download_dir)
+                state["purchased"][episode_id] = {
+                    "title": result.get("title"),
+                    "mode": "ticket",
+                    "account": email,
+                    "downloaded": result["success"],
+                    "total": result["total"],
+                    "at": datetime.now().isoformat()
+                }
+                save_state(state, state_dir)
+                save_accounts(accounts, accounts_file)
+                return True, accounts
+        
+        # 尝试 PT
+        if actual_pt < price:
+            logger.info(f"    Insufficient PT: {actual_pt} < {price}")
+            continue
+        
+        success, msg = http_purchase_pt(session, episode_id)
+        if success:
+            # 更新 PT（扣减）
+            account['pt'] = actual_pt - price
+            
+            result = download_episode(session, episode_id, series_name, download_dir)
+            state["purchased"][episode_id] = {
+                "title": result.get("title"),
+                "mode": "pt",
+                "account": email,
+                "price": price,
+                "downloaded": result["success"],
+                "total": result["total"],
+                "at": datetime.now().isoformat()
+            }
+            save_state(state, state_dir)
+            save_accounts(accounts, accounts_file)
+            return True, accounts
+        else:
+            logger.warning(f"    PT purchase failed: {msg}")
     
+    # 没成功，但保存更新后的 PT
+    save_accounts(accounts, accounts_file)
     logger.warning(f"  All accounts failed for {episode_id}")
-    return False
+    return False, accounts
 
 
 def monitor_series(
     series_id: str,
     series_name: str,
     accounts: List[dict],
+    accounts_file: Path,
     config: dict,
     logger
-) -> int:
-    """监控单部漫画"""
+) -> Tuple[int, List[dict]]:
+    """监控单部漫画
+    
+    返回: (success_count, updated_accounts)
+    """
     base_dir = get_base_dir()
     download_dir = base_dir / config.get("monitor", {}).get("download_dir", "./downloads")
     state_dir = base_dir / config.get("monitor", {}).get("state_dir", "./states")
@@ -683,24 +617,28 @@ def monitor_series(
     
     logger.info(f"Checking: {series_name} ({series_id})")
     
-    # 检查新章节
-    new_episodes = check_new_episodes(series_id, state, logger)
+    # 获取所有章节
+    episodes = fetch_episodes_from_atom(series_id)
+    if not episodes:
+        logger.warning(f"No episodes found")
+        return 0, accounts
+    
+    # 过滤已下载的
+    purchased = state.get("purchased", {})
+    new_episodes = [ep for ep in episodes if ep['id'] not in purchased]
     
     if not new_episodes:
         logger.info(f"  No new episodes")
         state["last_checked"] = datetime.now().isoformat()
         save_state(state, state_dir)
-        return 0
+        return 0, accounts
     
     logger.info(f"  Found {len(new_episodes)} new episodes")
     
-    # 按时间排序（旧的先处理）
-    new_episodes.reverse()
-    
     # 只处理最新的 N 话
     latest_only = config.get("monitor", {}).get("latest_only", 1)
-    if latest_only > 0:
-        new_episodes = new_episodes[-latest_only:]
+    if latest_only > 0 and len(new_episodes) > latest_only:
+        new_episodes = new_episodes[:latest_only]
         logger.info(f"  Processing latest {len(new_episodes)} episodes")
     
     # 处理每个新章节
@@ -708,11 +646,12 @@ def monitor_series(
     for ep in new_episodes:
         logger.info(f"  Episode: {ep['id']} - {ep['title'][:30] if ep['title'] else 'N/A'}")
         
-        success = process_episode(
+        success, accounts = process_episode(
             ep['id'],
             series_id,
             series_name,
             accounts,
+            accounts_file,
             state,
             download_dir,
             state_dir,
@@ -721,12 +660,11 @@ def monitor_series(
         
         if success:
             success_count += 1
-            state["last_episode_id"] = ep['id']
     
     state["last_checked"] = datetime.now().isoformat()
     save_state(state, state_dir)
     
-    return success_count
+    return success_count, accounts
 
 
 def main():
@@ -792,7 +730,9 @@ def main():
         series_id = comic.get("series_id")
         series_name = comic.get("name", series_id)
         
-        success = monitor_series(series_id, series_name, accounts, config, logger)
+        success, accounts = monitor_series(
+            series_id, series_name, accounts, accounts_file, config, logger
+        )
         total_success += success
     
     logger.info("=" * 60)
