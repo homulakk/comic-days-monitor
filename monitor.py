@@ -451,7 +451,9 @@ def load_state(series_id: str, state_dir: Path) -> dict:
         "last_episode_id": None,
         "last_checked": None,
         "purchased": {},
-        "pt_used": {}  # {email: total_pt_used}
+        "ticket_used": {},      # {email: timestamp}
+        "pt_used": {},          # {email: total_pt_used_in_this_series}
+        "accounts_pt": {}       # {email: actual_pt_balance} - 缓存账号 PT 余额
     }
 
 
@@ -507,34 +509,21 @@ def check_new_episodes(series_id: str, state: dict, logger) -> List[dict]:
     return episodes
 
 
-def find_available_accounts(accounts: List[dict], series_id: str, state: dict, logger) -> List[dict]:
-    """找到所有可能可用的账号（按优先级排序）
+def find_available_accounts(accounts: List[dict], state: dict) -> List[dict]:
+    """获取可用账号，跳过 PT=0 的"""
+    accounts_pt = state.get("accounts_pt", {})
     
-    优先级：
-    1. 票据已充能的账号
-    2. 其他账号
-    """
-    charged = []   # 票据已充能
-    recharging = []  # 票据充能中
-    
+    result = []
     for acc in accounts:
         email = acc.get('email')
+        pt = accounts_pt.get(email)
         
-        # 检查票据是否可用 (23小时充能)
-        ticket_info = state.get("ticket_used", {}).get(email)
-        if ticket_info:
-            try:
-                last_used = datetime.fromisoformat(ticket_info)
-                if datetime.now() - last_used < timedelta(hours=23):
-                    recharging.append(acc)  # 充能中，放后面
-                    continue
-            except:
-                pass
-        
-        charged.append(acc)  # 票据可用或未使用过
+        # PT 未记录或 PT > 0 → 尝试
+        if pt is None or pt > 0:
+            result.append(acc)
+        # PT = 0 → 跳过
     
-    # 优先返回票据充能完成的账号
-    return charged + recharging
+    return result
 
 
 def try_purchase_with_account(
@@ -548,12 +537,7 @@ def try_purchase_with_account(
     state_dir: Path,
     logger
 ) -> Tuple[bool, str]:
-    """尝试用单个账号购买章节
-    
-    返回: (success, reason)
-    - success: 是否成功
-    - reason: 失败原因 ('insufficient_pt', 'ticket_recharging', 'login_failed', 'purchase_failed', 'unknown')
-    """
+    """尝试用单个账号购买章节"""
     email = account['email']
     password = account['password']
     
@@ -563,88 +547,69 @@ def try_purchase_with_account(
     if not http_login(session, email, password):
         return False, 'login_failed'
     
-    # 获取实际 PT
+    # 获取 PT 并缓存
     user_info = http_get_user_info(session)
     actual_pt = user_info.get("point", {}).get("total", 0)
+    state.setdefault("accounts_pt", {})[email] = actual_pt
     
-    # 计算已使用的 PT
+    # 计算可用 PT
     pt_used = state.get("pt_used", {}).get(email, 0)
     available_pt = actual_pt - pt_used
     
     logger.info(f"    {email[:25]}... PT: {available_pt}")
     
-    # 尝试票据购买
-    if ep_info['has_ticket']:
-        # 检查票据是否充能
-        ticket_info = state.get("ticket_used", {}).get(email)
-        if ticket_info:
-            try:
-                last_used = datetime.fromisoformat(ticket_info)
-                if datetime.now() - last_used < timedelta(hours=23):
-                    logger.info(f"    Ticket recharging...")
-                else:
-                    # 票据可用，尝试购买
-                    success, msg = http_use_ticket(session, episode_id)
-                    if success:
-                        state.setdefault("ticket_used", {})[email] = datetime.now().isoformat()
-                        result = download_episode(session, episode_id, series_name, download_dir)
-                        state["purchased"][episode_id] = {
-                            "title": result.get("title"),
-                            "mode": "ticket",
-                            "account": email,
-                            "downloaded": result["success"],
-                            "total": result["total"],
-                            "at": datetime.now().isoformat()
-                        }
-                        save_state(state, state_dir)
-                        return True, 'ok'
-            except:
-                pass
-        else:
-            # 从未用过票据，尝试购买
-            success, msg = http_use_ticket(session, episode_id)
-            if success:
-                state.setdefault("ticket_used", {})[email] = datetime.now().isoformat()
-                result = download_episode(session, episode_id, series_name, download_dir)
-                state["purchased"][episode_id] = {
-                    "title": result.get("title"),
-                    "mode": "ticket",
-                    "account": email,
-                    "downloaded": result["success"],
-                    "total": result["total"],
-                    "at": datetime.now().isoformat()
-                }
-                save_state(state, state_dir)
-                return True, 'ok'
-            elif "TICKET_NOT_CHARGED" not in msg:
-                logger.warning(f"    Ticket purchase failed: {msg}")
-    
-    # 尝试 PT 购买
     price = ep_info.get('price', 0)
-    if price and available_pt >= price:
-        success, msg = http_purchase_pt(session, episode_id)
+    
+    # 尝试票据购买（如果可用）
+    ticket_info = state.get("ticket_used", {}).get(email)
+    ticket_charged = True
+    if ticket_info:
+        try:
+            last_used = datetime.fromisoformat(ticket_info)
+            if datetime.now() - last_used < timedelta(hours=23):
+                ticket_charged = False
+        except:
+            pass
+    
+    if ticket_charged:
+        success, msg = http_use_ticket(session, episode_id)
         if success:
-            state.setdefault("pt_used", {})[email] = pt_used + price
+            state.setdefault("ticket_used", {})[email] = datetime.now().isoformat()
             result = download_episode(session, episode_id, series_name, download_dir)
             state["purchased"][episode_id] = {
                 "title": result.get("title"),
-                "mode": "pt",
+                "mode": "ticket",
                 "account": email,
-                "price": price,
                 "downloaded": result["success"],
                 "total": result["total"],
                 "at": datetime.now().isoformat()
             }
             save_state(state, state_dir)
             return True, 'ok'
-        else:
-            logger.warning(f"    PT purchase failed: {msg}")
-            return False, 'purchase_failed'
-    else:
+    
+    # 票据不可用或失败，尝试 PT
+    if available_pt < price:
         logger.info(f"    Insufficient PT: {available_pt} < {price}")
         return False, 'insufficient_pt'
     
-    return False, 'unknown'
+    success, msg = http_purchase_pt(session, episode_id)
+    if success:
+        state.setdefault("pt_used", {})[email] = pt_used + price
+        result = download_episode(session, episode_id, series_name, download_dir)
+        state["purchased"][episode_id] = {
+            "title": result.get("title"),
+            "mode": "pt",
+            "account": email,
+            "price": price,
+            "downloaded": result["success"],
+            "total": result["total"],
+            "at": datetime.now().isoformat()
+        }
+        save_state(state, state_dir)
+        return True, 'ok'
+    else:
+        logger.warning(f"    PT purchase failed: {msg}")
+        return False, 'purchase_failed'
 
 
 def process_episode(
@@ -657,9 +622,9 @@ def process_episode(
     state_dir: Path,
     logger
 ) -> bool:
-    """处理单个章节 - 尝试所有账号直到成功"""
+    """处理单个章节 - 遍历账号直到买成功"""
     
-    # 先检查是否已购买/免费
+    # 检查是否免费
     session = requests.Session()
     ep_info = http_get_episode_info(episode_id, session)
     
@@ -676,16 +641,10 @@ def process_episode(
         save_state(state, state_dir)
         return True
     
-    # 需要购买 - 获取所有可用账号
-    available_accounts = find_available_accounts(accounts, series_id, state, logger)
-    
-    if not available_accounts:
-        logger.warning(f"  No accounts available for {episode_id}")
-        return False
-    
+    # 需要购买
+    available_accounts = find_available_accounts(accounts, state)
     logger.info(f"  Trying {len(available_accounts)} accounts...")
     
-    # 逐个尝试账号
     for account in available_accounts:
         success, reason = try_purchase_with_account(
             account, episode_id, series_id, series_name,
@@ -696,16 +655,11 @@ def process_episode(
             logger.info(f"  Purchase successful!")
             return True
         
-        # 如果是登录失败，继续下一个
         if reason == 'login_failed':
             continue
         
-        # 如果是 PT 不足，继续下一个账号
         if reason == 'insufficient_pt':
-            continue
-        
-        # 其他错误也继续尝试
-        continue
+            continue  # 下一个账号
     
     logger.warning(f"  All accounts failed for {episode_id}")
     return False
