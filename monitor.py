@@ -61,6 +61,96 @@ def get_base_dir() -> Path:
 
 
 # ============================================================================
+# URL 解析
+# ============================================================================
+
+def parse_series_id_from_url(url: str) -> Tuple[Optional[str], bool]:
+    """从 URL 中提取 series_id
+    
+    返回: (series_id, is_episode_url)
+    - 如果是 series URL，直接返回 series_id
+    - 如果是 episode URL，返回 episode_id 和 True（需要进一步查询 series_id）
+    """
+    # 匹配 /series/{series_id}
+    series_match = re.search(r'/series/(\d+)', url)
+    if series_match:
+        return series_match.group(1), False
+    
+    # 匹配 /episode/{episode_id}
+    episode_match = re.search(r'/episode/(\d+)', url)
+    if episode_match:
+        return episode_match.group(1), True
+    
+    # 纯数字，假设是 series_id
+    if url.isdigit():
+        return url, False
+    
+    return None, False
+
+
+def get_series_id_from_episode(episode_id: str) -> Optional[str]:
+    """从 episode 页面提取 series_id"""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/episode/{episode_id}",
+            headers=get_headers(),
+            timeout=15
+        )
+        
+        # 方法1: 从 next/prev 链接中找 series
+        series_match = re.search(r'/series/(\d+)', resp.text)
+        if series_match:
+            return series_match.group(1)
+        
+        # 方法2: 从 JSON 数据中找
+        json_match = re.search(r'"series"\s*:\s*\{\s*"databaseId"\s*:\s*"?(\d+)"?', resp.text)
+        if json_match:
+            return json_match.group(1)
+        
+    except Exception:
+        pass
+    
+    return None
+
+
+def normalize_comic_config(comic: dict, logger) -> Optional[dict]:
+    """标准化漫画配置，支持 URL 或 series_id"""
+    result = {"enabled": comic.get("enabled", True), "name": comic.get("name", "Unknown")}
+    
+    # 如果已有 series_id，直接用
+    if comic.get("series_id"):
+        result["series_id"] = comic["series_id"]
+        return result
+    
+    # 如果有 URL，解析
+    if comic.get("url"):
+        url = comic["url"]
+        parsed_id, is_episode = parse_series_id_from_url(url)
+        
+        if parsed_id is None:
+            logger.error(f"Cannot parse URL: {url}")
+            return None
+        
+        if is_episode:
+            # 从 episode URL 获取 series_id
+            logger.info(f"Extracting series_id from episode {parsed_id}...")
+            series_id = get_series_id_from_episode(parsed_id)
+            if series_id:
+                result["series_id"] = series_id
+                logger.info(f"  Found series_id: {series_id}")
+            else:
+                logger.error(f"Cannot find series_id from episode {parsed_id}")
+                return None
+        else:
+            result["series_id"] = parsed_id
+        
+        return result
+    
+    logger.error(f"Comic config missing series_id or url: {comic}")
+    return None
+
+
+# ============================================================================
 # 日志配置
 # ============================================================================
 
@@ -641,7 +731,13 @@ def main():
         return 1
     
     # 监控列表
-    comics = config.get("comics", [])
+    comics_raw = config.get("comics", [])
+    comics = []
+    
+    for comic in comics_raw:
+        normalized = normalize_comic_config(comic, logger)
+        if normalized:
+            comics.append(normalized)
     
     if args.series:
         comics = [c for c in comics if c.get("series_id") == args.series]

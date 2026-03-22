@@ -1,11 +1,20 @@
 # Comic-Days 监控配置
 
 # 要监控的漫画列表
+# 支持三种格式:
+#   1. series_id: "3269632237268447047"
+#   2. url: "https://comic-days.com/series/3269632237268447047"
+#   3. url: "https://comic-days.com/episode/2551460909710194586" (会自动提取series_id)
 comics:
-  # 作品ID可以从URL获取: https://comic-days.com/series/{series_id}
-  - series_id: "3269632237268447047"
+  # 直接粘贴 URL
+  - url: "https://comic-days.com/series/3269632237268447047"
     name: "雨夜の月"
     enabled: true
+  
+  # 或者用 episode 链接
+  # - url: "https://comic-days.com/episode/2551460909710194586"
+  #   name: "某漫画"
+  #   enabled: true
 
 # 监控设置
 monitor:
