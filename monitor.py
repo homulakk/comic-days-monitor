@@ -25,6 +25,8 @@ import base64
 import math
 import argparse
 import logging
+import tempfile
+import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple
@@ -455,14 +457,25 @@ def load_state(series_id: str, state_dir: Path) -> dict:
 
 
 def save_state(state: dict, state_dir: Path):
-    """保存作品状态"""
+    """保存作品状态（原子写入）"""
     state_dir.mkdir(parents=True, exist_ok=True)
     state_file = state_dir / f"{state['series_id']}.json"
-    state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+    
+    # 原子写入
+    temp_file = state_file.with_suffix('.tmp')
+    try:
+        temp_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+        if state_file.exists():
+            state_file.unlink()
+        temp_file.rename(state_file)
+    except Exception as e:
+        if temp_file.exists():
+            temp_file.unlink()
+        raise e
 
 
 def load_accounts(accounts_file: Path) -> List[dict]:
-    """加载账号池（包含 PT 余额）"""
+    """加载账号池（包含 PT 余额和可选 Session）"""
     if not accounts_file.exists():
         return []
     
@@ -474,9 +487,46 @@ def load_accounts(accounts_file: Path) -> List[dict]:
 
 
 def save_accounts(accounts: List[dict], accounts_file: Path):
-    """保存账号池（包含更新的 PT）"""
-    data = {'accounts': accounts}
-    accounts_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    """保存账号池（原子写入）"""
+    data = {'accounts': accounts, 'updated_at': datetime.now().isoformat()}
+    
+    # 原子写入：先写临时文件，再重命名
+    temp_file = accounts_file.with_suffix('.tmp')
+    try:
+        temp_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        # Windows 需要先删除目标文件
+        if accounts_file.exists():
+            accounts_file.unlink()
+        temp_file.rename(accounts_file)
+    except Exception as e:
+        if temp_file.exists():
+            temp_file.unlink()
+        raise e
+
+
+# 全局 Session 缓存（避免频繁登录）
+_session_cache: Dict[str, requests.Session] = {}
+
+
+def get_session(email: str, password: str, force_new: bool = False) -> Optional[requests.Session]:
+    """获取或创建 Session（带缓存）"""
+    if not force_new and email in _session_cache:
+        session = _session_cache[email]
+        # 验证 Session 是否有效
+        try:
+            resp = session.get(f"{BASE_URL}/my.json", headers=get_headers(), timeout=10)
+            if resp.status_code == 200 and resp.json().get('logged_in'):
+                return session
+        except:
+            pass
+    
+    # 需要重新登录
+    session = requests.Session()
+    if http_login(session, email, password):
+        _session_cache[email] = session
+        return session
+    
+    return None
 
 
 def process_episode(
@@ -519,9 +569,10 @@ def process_episode(
         email = account['email']
         password = account['password']
         
-        # 登录
-        session = requests.Session()
-        if not http_login(session, email, password):
+        # 获取 Session（带缓存，避免频繁登录）
+        session = get_session(email, password)
+        if session is None:
+            logger.info(f"    {email[:25]}... login failed")
             continue
         
         # 获取真实 PT

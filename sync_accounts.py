@@ -46,12 +46,10 @@ def strip_account_data(accounts_file: str, output_file: str = None) -> dict:
 
 
 def merge_accounts(source_file: str, target_file: str, output_file: str = None) -> dict:
-    """合并账号数据
+    """合并账号数据（基于时间戳）
     
-    - 从 source 读取 email/password（本地新账号）
-    - 从 target 读取 pt（服务器已消费的 PT）
-    - PT 取较小值（因为 PT 只减不增）
-    - 新账号直接添加
+    - 新账号：直接添加
+    - 已存在账号：以 updated_at 时间戳更新的为准
     """
     with open(source_file, 'r', encoding='utf-8') as f:
         source_data = json.load(f)
@@ -59,10 +57,11 @@ def merge_accounts(source_file: str, target_file: str, output_file: str = None) 
     with open(target_file, 'r', encoding='utf-8') as f:
         target_data = json.load(f)
     
-    # 建立 email -> target account 的映射
-    target_by_email = {}
-    for acc in target_data.get('accounts', []):
-        target_by_email[acc.get('email')] = acc
+    source_time = source_data.get('updated_at', '1970-01-01')
+    target_time = target_data.get('updated_at', '1970-01-01')
+    
+    # 建立 email -> account 映射
+    target_by_email = {acc.get('email'): acc for acc in target_data.get('accounts', [])}
     
     merged_accounts = []
     new_count = 0
@@ -70,35 +69,32 @@ def merge_accounts(source_file: str, target_file: str, output_file: str = None) 
     
     for src_acc in source_data.get('accounts', []):
         email = src_acc.get('email')
-        merged = {
-            'email': email,
-            'password': src_acc.get('password')
-        }
         
         if email in target_by_email:
-            # 已存在的账号
             tgt_acc = target_by_email[email]
-            src_pt = src_acc.get('pt')
-            tgt_pt = tgt_acc.get('pt')
             
-            # PT 取较小值（真实消费后的值更准确）
-            if src_pt is not None and tgt_pt is not None:
-                merged['pt'] = min(src_pt, tgt_pt)
-            elif tgt_pt is not None:
-                merged['pt'] = tgt_pt
-            elif src_pt is not None:
-                merged['pt'] = src_pt
+            # 比较时间戳，取更新的
+            if source_time > target_time:
+                merged = dict(src_acc)  # 用 source
+            else:
+                merged = dict(tgt_acc)  # 用 target
+                # 但密码用 source（可能已更新）
+                merged['password'] = src_acc.get('password', merged.get('password'))
             
             updated_count += 1
         else:
-            # 新账号，保留 PT
-            if 'pt' in src_acc:
-                merged['pt'] = src_acc['pt']
+            # 新账号
+            merged = dict(src_acc)
+            if 'pt' not in merged:
+                merged['pt'] = 0  # 新账号默认 PT=0，运行时查询
             new_count += 1
         
         merged_accounts.append(merged)
     
-    result = {'accounts': merged_accounts}
+    result = {
+        'accounts': merged_accounts,
+        'updated_at': datetime.now().isoformat()
+    }
     
     if output_file:
         with open(output_file, 'w', encoding='utf-8') as f:
