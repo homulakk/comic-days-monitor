@@ -48,9 +48,10 @@ def strip_account_data(accounts_file: str, output_file: str = None) -> dict:
 def merge_accounts(source_file: str, target_file: str, output_file: str = None) -> dict:
     """合并账号数据
     
-    - 从 source 读取 email/password
-    - 从 target 读取 pt/ticket_used
-    - 合并后输出
+    - 从 source 读取 email/password（本地新账号）
+    - 从 target 读取 pt（服务器已消费的 PT）
+    - PT 取较小值（因为 PT 只减不增）
+    - 新账号直接添加
     """
     with open(source_file, 'r', encoding='utf-8') as f:
         source_data = json.load(f)
@@ -63,8 +64,10 @@ def merge_accounts(source_file: str, target_file: str, output_file: str = None) 
     for acc in target_data.get('accounts', []):
         target_by_email[acc.get('email')] = acc
     
-    # 合并
     merged_accounts = []
+    new_count = 0
+    updated_count = 0
+    
     for src_acc in source_data.get('accounts', []):
         email = src_acc.get('email')
         merged = {
@@ -72,13 +75,26 @@ def merge_accounts(source_file: str, target_file: str, output_file: str = None) 
             'password': src_acc.get('password')
         }
         
-        # 保留 target 中的 pt 和 ticket_used
         if email in target_by_email:
+            # 已存在的账号
             tgt_acc = target_by_email[email]
-            if 'pt' in tgt_acc:
-                merged['pt'] = tgt_acc['pt']
-            if 'ticket_used' in tgt_acc:
-                merged['ticket_used'] = tgt_acc['ticket_used']
+            src_pt = src_acc.get('pt')
+            tgt_pt = tgt_acc.get('pt')
+            
+            # PT 取较小值（真实消费后的值更准确）
+            if src_pt is not None and tgt_pt is not None:
+                merged['pt'] = min(src_pt, tgt_pt)
+            elif tgt_pt is not None:
+                merged['pt'] = tgt_pt
+            elif src_pt is not None:
+                merged['pt'] = src_pt
+            
+            updated_count += 1
+        else:
+            # 新账号，保留 PT
+            if 'pt' in src_acc:
+                merged['pt'] = src_acc['pt']
+            new_count += 1
         
         merged_accounts.append(merged)
     
@@ -87,7 +103,7 @@ def merge_accounts(source_file: str, target_file: str, output_file: str = None) 
     if output_file:
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
-        print(f"Merged {len(merged_accounts)} accounts to {output_file}")
+        print(f"Merged {len(merged_accounts)} accounts: {updated_count} updated, {new_count} new")
     
     return result
 
